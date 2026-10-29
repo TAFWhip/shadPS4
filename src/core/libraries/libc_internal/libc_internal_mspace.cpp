@@ -11,7 +11,7 @@
 //
 // All bookkeeping is kept on the host side so that guest memory corruption cannot break the
 // allocator, and the returned handle is simply the base of the region, mirroring dlmalloc's
-// create_mspace_with_base.
+// create_mspace_with_base. See CUSA04607 (Batman: Return to Arkham) for a game that needs this.
 
 #include <algorithm>
 #include <cstdlib>
