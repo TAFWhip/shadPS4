@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
@@ -13,20 +14,105 @@
 #include "core/signals.h"
 #include "emulator.h"
 
+#ifdef ARCH_X86_64
+#include <Zydis/Formatter.h>
+#endif
+#include "core/libraries/kernel/memory.h"
+#include "core/memory.h"
+
 #ifdef _WIN32
 #include <windows.h>
 static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 #else
 #include <csignal>
 #include <pthread.h>
-#ifdef ARCH_X86_64
-#include <Zydis/Formatter.h>
-#endif
 #endif
 
 namespace Core {
 
+static std::string DisassembleInstruction(void* code_address) {
+    char buffer[256] = "<unable to decode>";
+
+#ifdef ARCH_X86_64
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    const auto status =
+        Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
+    if (ZYAN_SUCCESS(status)) {
+        ZydisFormatter formatter;
+        ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+        ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
+                                        instruction.operand_count_visible, buffer, sizeof(buffer),
+                                        reinterpret_cast<u64>(code_address), ZYAN_NULL);
+    }
+#endif
+
+    return buffer;
+}
+
+// Describes which guest memory region (if any) contains addr. Used for crash reports only.
+[[maybe_unused]] static std::string DescribeGuestAddress(u64 addr) {
+    Libraries::Kernel::OrbisVirtualQueryInfo info{};
+    auto* memory = Core::Memory::Instance();
+    if (memory->VirtualQuery(addr, 0, &info) == 0) {
+        const char* kind = info.is_stack       ? "stack"
+                           : info.is_direct    ? "direct"
+                           : info.is_flexible  ? "flexible"
+                           : info.is_pooled    ? "pooled"
+                           : info.is_committed ? "mapped"
+                                               : "reserved (not committed)";
+        return fmt::format("inside {} region [{:#x}, {:#x}) prot={:#x} name='{}'", kind, info.start,
+                           info.end, info.protection, info.name);
+    }
+    if (memory->VirtualQuery(addr, 1, &info) == 0) {
+        return fmt::format("NOT MAPPED (next region starts at {:#x}, {:#x} bytes away, name='{}')",
+                           info.start, info.start - addr, info.name);
+    }
+    return "NOT MAPPED (outside guest address space)";
+}
+
 #if defined(_WIN32)
+
+static void ReportUnhandledException(EXCEPTION_POINTERS* pExp) noexcept {
+    if (pExp == nullptr || pExp->ExceptionRecord == nullptr || pExp->ContextRecord == nullptr) {
+        return;
+    }
+    const auto* record = pExp->ExceptionRecord;
+    const auto* ctx = pExp->ContextRecord;
+    try {
+        LOG_CRITICAL(Debug, "Faulting instruction: {}",
+                     DisassembleInstruction(reinterpret_cast<void*>(ctx->Rip)));
+        if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+            const u64 kind = record->ExceptionInformation[0];
+            const u64 fault_addr = record->ExceptionInformation[1];
+            const char* access = kind == 0 ? "Read from" : kind == 1 ? "Write to" : "Executed from";
+            LOG_CRITICAL(Debug, "{} address {:#x}: {}", access, fault_addr,
+                         DescribeGuestAddress(fault_addr));
+        }
+        LOG_CRITICAL(Debug, "RIP={:#x} RSP={:#x} RBP={:#x}", ctx->Rip, ctx->Rsp, ctx->Rbp);
+        LOG_CRITICAL(Debug, "RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}", ctx->Rax, ctx->Rbx, ctx->Rcx,
+                     ctx->Rdx);
+        LOG_CRITICAL(Debug, "RSI={:#x} RDI={:#x} R8={:#x} R9={:#x}", ctx->Rsi, ctx->Rdi, ctx->R8,
+                     ctx->R9);
+        LOG_CRITICAL(Debug, "R10={:#x} R11={:#x} R12={:#x} R13={:#x} R14={:#x} R15={:#x}", ctx->R10,
+                     ctx->R11, ctx->R12, ctx->R13, ctx->R14, ctx->R15);
+        // Dump the top of the stack so return addresses into game code can be identified.
+        Libraries::Kernel::OrbisVirtualQueryInfo info{};
+        if (Core::Memory::Instance()->VirtualQuery(ctx->Rsp, 0, &info) == 0 && info.is_committed) {
+            const u64 count = std::min<u64>(24, (info.end - ctx->Rsp) / sizeof(u64));
+            const auto* stack = reinterpret_cast<const u64*>(ctx->Rsp);
+            for (u64 i = 0; i < count; i += 4) {
+                std::string line;
+                for (u64 j = i; j < std::min<u64>(i + 4, count); ++j) {
+                    line += fmt::format(" {:016x}", stack[j]);
+                }
+                LOG_CRITICAL(Debug, "Stack [RSP+{:#04x}]:{}", i * sizeof(u64), line);
+            }
+        }
+    } catch (...) {
+        // Never let crash reporting itself throw out of the exception handler.
+    }
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
@@ -143,6 +229,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        ReportUnhandledException(pExp);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 
@@ -150,26 +237,6 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
 }
 
 #else
-
-static std::string DisassembleInstruction(void* code_address) {
-    char buffer[256] = "<unable to decode>";
-
-#ifdef ARCH_X86_64
-    ZydisDecodedInstruction instruction;
-    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-    const auto status =
-        Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
-    if (ZYAN_SUCCESS(status)) {
-        ZydisFormatter formatter;
-        ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
-        ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
-                                        instruction.operand_count_visible, buffer, sizeof(buffer),
-                                        reinterpret_cast<u64>(code_address), ZYAN_NULL);
-    }
-#endif
-
-    return buffer;
-}
 
 static s32 NativeSiCodeToGuest(s32 sig, s32 code) {
     using namespace Libraries::Kernel;
