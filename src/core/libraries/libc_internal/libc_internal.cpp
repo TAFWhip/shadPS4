@@ -10,6 +10,7 @@
 #include "libc_internal_io.h"
 #include "libc_internal_math.h"
 #include "libc_internal_memory.h"
+#include "libc_internal_mspace.h"
 #include "libc_internal_str.h"
 #include "libc_internal_threads.h"
 #include "printf.h"
@@ -20,6 +21,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     RegisterlibSceLibcInternalMath(sym);
     RegisterlibSceLibcInternalStr(sym);
     RegisterlibSceLibcInternalMemory(sym);
+    RegisterlibSceLibcInternalMspace(sym);
     RegisterlibSceLibcInternalIo(sym);
     RegisterlibSceLibcInternalThreads(sym);
 }
