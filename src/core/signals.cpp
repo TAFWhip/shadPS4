@@ -73,6 +73,63 @@ static std::string DisassembleInstruction(void* code_address) {
 
 #if defined(_WIN32)
 
+static bool IsGuestRangeReadable(u64 addr, u64 size) {
+    Libraries::Kernel::OrbisVirtualQueryInfo info{};
+    return Core::Memory::Instance()->VirtualQuery(addr, 0, &info) == 0 && info.is_committed &&
+           (info.protection & static_cast<s32>(Core::MemoryProt::CpuRead)) != 0 &&
+           addr + size <= info.end;
+}
+
+static bool IsGuestCodeAddress(u64 addr) {
+    constexpr u64 MinGuestAddress = 0x400000;
+    constexpr u64 MaxGuestAddress = 0x10000000000;
+    if (addr < MinGuestAddress || addr >= MaxGuestAddress) {
+        return false;
+    }
+    Libraries::Kernel::OrbisVirtualQueryInfo info{};
+    return Core::Memory::Instance()->VirtualQuery(addr, 0, &info) == 0 && info.is_committed &&
+           (info.protection & static_cast<s32>(Core::MemoryProt::CpuExec)) != 0;
+}
+
+static void DumpGuestBytes(const char* label, u64 addr, u64 before, u64 after) {
+    const u64 start = addr - before;
+    const u64 size = before + after;
+    if (!IsGuestRangeReadable(start, size)) {
+        return;
+    }
+    const auto* bytes = reinterpret_cast<const u8*>(start);
+    for (u64 offset = 0; offset < size; offset += 32) {
+        std::string line;
+        for (u64 i = offset; i < std::min<u64>(offset + 32, size); ++i) {
+            line += fmt::format("{:02x}", bytes[i]);
+        }
+        LOG_CRITICAL(Debug, "Code {} [{:#x}]: {}", label, start + offset, line);
+    }
+}
+
+static std::string DescribeHostAddress(u64 addr) {
+    const auto* base = reinterpret_cast<const u8*>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const u64 image_base = reinterpret_cast<u64>(base);
+    if (addr < image_base || addr >= image_base + nt->OptionalHeader.SizeOfImage) {
+        return "";
+    }
+    const u64 rva = addr - image_base;
+    const auto* section = IMAGE_FIRST_SECTION(nt);
+    for (u32 i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        const u64 start = section->VirtualAddress;
+        const u64 end = start + std::max<u64>(section->Misc.VirtualSize, section->SizeOfRawData);
+        if (rva >= start && rva < end) {
+            const std::string name(
+                reinterpret_cast<const char*>(section->Name),
+                strnlen(reinterpret_cast<const char*>(section->Name), IMAGE_SIZEOF_SHORT_NAME));
+            return fmt::format("shadPS4.exe+{:#x} ({})", rva, name);
+        }
+    }
+    return fmt::format("shadPS4.exe+{:#x}", rva);
+}
+
 static void ReportUnhandledException(EXCEPTION_POINTERS* pExp) noexcept {
     if (pExp == nullptr || pExp->ExceptionRecord == nullptr || pExp->ContextRecord == nullptr) {
         return;
@@ -107,6 +164,22 @@ static void ReportUnhandledException(EXCEPTION_POINTERS* pExp) noexcept {
                     line += fmt::format(" {:016x}", stack[j]);
                 }
                 LOG_CRITICAL(Debug, "Stack [RSP+{:#04x}]:{}", i * sizeof(u64), line);
+            }
+
+            DumpGuestBytes("at RIP", ctx->Rip, 0xC0, 0x40);
+            const u64 scan = std::min<u64>(128, (info.end - ctx->Rsp) / sizeof(u64));
+            u32 frames = 0;
+            for (u64 i = 0; i < scan && frames < 8; ++i) {
+                const u64 value = stack[i];
+                if (IsGuestCodeAddress(value)) {
+                    LOG_CRITICAL(Debug, "Possible return address [RSP+{:#x}]: {:#x}",
+                                 i * sizeof(u64), value);
+                    DumpGuestBytes("before return", value, 0x60, 0x10);
+                    ++frames;
+                } else if (const auto host = DescribeHostAddress(value); !host.empty()) {
+                    LOG_CRITICAL(Debug, "Host address [RSP+{:#x}]: {:#x} = {}", i * sizeof(u64),
+                                 value, host);
+                }
             }
         }
     } catch (...) {
